@@ -1,6 +1,7 @@
 #pragma once
 
 #include <esp_netif_types.h>
+#include <esp_timer.h>
 #include <esp_wifi.h>
 
 #include <ebus/detail/json_writer.hpp>
@@ -61,6 +62,14 @@ class WifiNetworkManager {
   // anyway). Counter resets on every successful connect.
   static void logWifiSlice();
   static int consecutive_failures_;
+
+ public:
+  static void staWatchdog(void* arg);
+
+ private:
+  static bool sta_reconnect_deferred_;
+  static int64_t sta_down_since_us_;
+  static esp_timer_handle_t sta_watchdog_timer_;
 
   static ConfigManager* config_manager_;
   static esp_ip4_addr_t ip_address_;

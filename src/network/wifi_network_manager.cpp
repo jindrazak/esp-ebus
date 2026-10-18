@@ -4,6 +4,7 @@
 #include <driver/gpio.h>
 #include <esp_event.h>
 #include <esp_netif.h>
+#include <esp_system.h>
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -26,6 +27,8 @@
 
 namespace {
 constexpr int max_consecutive_failures = 5;
+constexpr uint64_t watchdog_period_us = 30ULL * 1000 * 1000;
+constexpr int64_t offline_restart_us = 10LL * 60 * 1000 * 1000;
 
 bool wifiApHasConnectedClients() {
   wifi_sta_list_t sta_list{};
@@ -45,6 +48,9 @@ int WifiNetworkManager::reconnect_count_ = 0;
 int WifiNetworkManager::consecutive_failures_ = 0;
 bool WifiNetworkManager::sta_connected_ = false;
 bool WifiNetworkManager::sta_configured_ = false;
+bool WifiNetworkManager::sta_reconnect_deferred_ = false;
+int64_t WifiNetworkManager::sta_down_since_us_ = 0;
+esp_timer_handle_t WifiNetworkManager::sta_watchdog_timer_ = nullptr;
 TaskHandle_t WifiNetworkManager::status_led_task_handle_ = nullptr;
 volatile WifiNetworkManager::StatusLedMode
     WifiNetworkManager::status_led_mode_ =
@@ -211,7 +217,40 @@ void WifiNetworkManager::begin(ConfigManager* config_manager) {
   // up to hundreds of ms link jitter and wake bursts preempt everything
   // below WiFi priority (including the bus thread) at the worst moment.
   esp_wifi_set_ps(WIFI_PS_NONE);
+  sta_down_since_us_ = esp_timer_get_time();
   esp_wifi_connect();
+
+  const esp_timer_create_args_t watchdog_args = {
+      .callback = &WifiNetworkManager::staWatchdog,
+      .arg = nullptr,
+      .dispatch_method = ESP_TIMER_TASK,
+      .name = "wifi_wd",
+      .skip_unhandled_events = true};
+  if (esp_timer_create(&watchdog_args, &sta_watchdog_timer_) == ESP_OK) {
+    esp_timer_start_periodic(sta_watchdog_timer_, watchdog_period_us);
+  } else {
+    logger.error("WiFi watchdog timer create failed");
+  }
+}
+
+// Retries a deferred reconnect and reboots after a long STA outage; neither
+// happens while a client is using the fallback AP, so configuration over the
+// AP is not interrupted.
+void WifiNetworkManager::staWatchdog(void* arg) {
+  (void)arg;
+  if (!sta_configured_ || sta_connected_) return;
+
+  if (sta_reconnect_deferred_) {
+    sta_reconnect_deferred_ = false;
+    logger.warn("Retrying deferred STA reconnect");
+    esp_wifi_connect();
+  }
+
+  if (sta_down_since_us_ != 0 && !wifiApHasConnectedClients() &&
+      esp_timer_get_time() - sta_down_since_us_ > offline_restart_us) {
+    logger.error("STA offline too long, restarting");
+    esp_restart();
+  }
 }
 
 uint32_t WifiNetworkManager::getLastConnect() { return last_connect_; }
@@ -390,6 +429,8 @@ void WifiNetworkManager::handleEvent(
     }
 
     sta_connected_ = true;
+    sta_reconnect_deferred_ = false;
+    sta_down_since_us_ = 0;
     consecutive_failures_ = 0;
     setStatusLedMode(StatusLedMode::solid_on);
     last_connect_ = (uint32_t)(esp_timer_get_time() / 1000ULL);
@@ -404,6 +445,7 @@ void WifiNetworkManager::handleEvent(
     }
   } else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
     sta_connected_ = false;
+    if (sta_down_since_us_ == 0) sta_down_since_us_ = esp_timer_get_time();
     setStatusLedMode(StatusLedMode::slow_blink);
     logger.warn("STA disconnected");
 
@@ -417,6 +459,7 @@ void WifiNetworkManager::handleEvent(
     if (sta_configured_) {
       if (wifiApHasConnectedClients()) {
         logger.warn("AP is serving connected clients; deferring STA reconnect");
+        sta_reconnect_deferred_ = true;
         return;
       }
       logger.warn("Attempting STA reconnect");

@@ -60,7 +60,7 @@ def generate():
         "constexpr HAProfile profiles[] = {",
     ]
 
-    max_key_value_pairs = 5
+    max_key_value_pairs = 8
     for p in profiles:
         name = p["name"]
         component = p["component"]
